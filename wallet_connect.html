@@ -17,11 +17,12 @@
     #status { margin-top: .75rem; font-size: .85rem; color: #888; }
     .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #4caf50; margin-right: 6px; }
   </style>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/stellar-freighter-api/6.0.1/index.min.js" defer></script>
 </head>
 <body>
   <div class="card">
     <h1>🌟 OrbitChain Wallet Connect</h1>
-    <button id="connect-btn" onclick="connectWallet()">Connect Wallet</button>
+    <button id="connect-btn">Connect Wallet</button>
 
     <div id="wallet-info">
       <p><span class="dot"></span><strong>Wallet Connected</strong></p>
@@ -29,58 +30,9 @@
       <div id="wallet-address"></div>
     </div>
 
-    <p id="status"></p>
+    <p id="status" aria-live="polite"></p>
   </div>
 
-  <script>
-    const btn = document.getElementById('connect-btn');
-    const walletInfo = document.getElementById('wallet-info');
-    const walletAddress = document.getElementById('wallet-address');
-    const status = document.getElementById('status');
-
-    async function connectWallet() {
-      status.textContent = 'Connecting…';
-      btn.disabled = true;
-
-      try {
-        // Freighter wallet API (https://docs.freighter.app)
-        // Check for Freighter wallet extension
-        if (typeof window.freighter !== 'undefined') {
-          const connected = await window.freighter.isConnected();
-          if (!connected) await window.freighter.connect();
-          const { address } = await window.freighter.getAddress();
-          showConnected(address);
-        } else {
-          // Fallback: prompt for manual address entry (dev/demo mode)
-          const addr = prompt('Freighter not detected.\nEnter your Stellar public key to continue:');
-          if (addr && addr.startsWith('G') && addr.length === 56) {
-            showConnected(addr);
-          } else {
-            throw new Error('Invalid or cancelled address input.');
-          }
-        }
-      } catch (err) {
-        status.textContent = '❌ ' + err.message;
-        btn.disabled = false;
-      }
-    }
-
-    function showConnected(address) {
-      walletAddress.textContent = address;
-      walletInfo.style.display = 'block';
-      btn.textContent = 'Disconnect';
-      btn.onclick = disconnectWallet;
-      btn.disabled = false;
-      status.textContent = '';
-    }
-
-    function disconnectWallet() {
-      walletInfo.style.display = 'none';
-      walletAddress.textContent = '';
-      btn.textContent = 'Connect Wallet';
-      btn.onclick = connectWallet;
-      status.textContent = 'Disconnected.';
-    }
-  </script>
+  <script src="wallet_connect.js" defer></script>
 </body>
 </html>
