@@ -97,11 +97,83 @@
         return sep7TxUri(xdr, callbackUrl);
       },
     },
+    // Desktop browser-extension adapters (issue #142). Uniform interface:
+    // `detect()` — is the extension injected into this page right now?
+    // `connect()` — resolve the user's public key (G…) via the extension's
+    // own approval flow. Each adapter uses the API documented by its vendor;
+    // detection is by injected global, same pattern the Freighter path
+    // always used.
     {
       id: 'freighter',
       name: 'Freighter',
       platforms: ['desktop'],
       icon: '🚀',
+      detect: function () {
+        return typeof global.freighter !== 'undefined';
+      },
+      connect: function () {
+        return Promise.resolve()
+          .then(function () { return global.freighter.isConnected(); })
+          .then(function (connected) {
+            if (!connected) return global.freighter.connect();
+          })
+          .then(function () { return global.freighter.getAddress(); })
+          .then(function (res) { return res.address; });
+      },
+    },
+    {
+      id: 'albedo',
+      name: 'Albedo',
+      platforms: ['desktop'],
+      icon: '🔆',
+      detect: function () {
+        return typeof global.albedo !== 'undefined' && typeof global.albedo.publicKey === 'function';
+      },
+      connect: function () {
+        return global.albedo.publicKey({}).then(function (res) { return res.pubkey; });
+      },
+    },
+    {
+      id: 'rabet',
+      name: 'Rabet',
+      platforms: ['desktop'],
+      icon: '🦊',
+      detect: function () {
+        return typeof global.rabet !== 'undefined' && typeof global.rabet.connect === 'function';
+      },
+      connect: function () {
+        return global.rabet.connect().then(function (res) { return res.publicKey; });
+      },
+    },
+    {
+      id: 'xbull',
+      name: 'xBull',
+      platforms: ['desktop'],
+      icon: '🐂',
+      detect: function () {
+        return typeof global.xBullSDK !== 'undefined';
+      },
+      connect: function () {
+        return global.xBullSDK
+          .connect({ canRequestPublicKey: true, canRequestSign: true })
+          .then(function () { return global.xBullSDK.getPublicKey(); });
+      },
+    },
+    {
+      id: 'lobstr-extension',
+      name: 'LOBSTR Extension',
+      platforms: ['desktop'],
+      icon: '🦞',
+      detect: function () {
+        return typeof global.lobstrApi !== 'undefined' && typeof global.lobstrApi.getPublicKey === 'function';
+      },
+      connect: function () {
+        return Promise.resolve()
+          .then(function () {
+            if (typeof global.lobstrApi.connect === 'function') return global.lobstrApi.connect();
+          })
+          .then(function () { return global.lobstrApi.getPublicKey(); });
+      },
     },
   ];
 
@@ -116,6 +188,22 @@
   function walletsFor(platform) {
     return WALLETS.filter(function (w) {
       return w.platforms.indexOf(platform) !== -1;
+    });
+  }
+
+  /**
+   * Desktop wallets whose browser extension is actually injected into this
+   * page right now (issue #142). The page uses this to decide between
+   * connecting directly (one wallet), showing a chooser (several), or
+   * falling back to manual entry (none).
+   */
+  function detectedDesktopWallets() {
+    return walletsFor('desktop').filter(function (w) {
+      try {
+        return typeof w.detect === 'function' && w.detect();
+      } catch (e) {
+        return false;
+      }
     });
   }
 
@@ -213,6 +301,7 @@
   global.OrbitWalletConnect = {
     isMobile: isMobile,
     walletsFor: walletsFor,
+    detectedDesktopWallets: detectedDesktopWallets,
     WALLETS: WALLETS,
     Sep10: Sep10,
     startMobileConnect: startMobileConnect,
@@ -380,6 +469,7 @@ function createWalletSession({
   ui,
   emit = () => {},
   mobile = null,
+  desktop = null,
 }) {
   let connected = false;
 
@@ -486,11 +576,46 @@ function createWalletSession({
     return null;
   }
 
+  // Persist + surface a successful connection. Shared by every connect path
+  // (Freighter provider, desktop extension registry, manual entry, mobile).
+  function completeConnection(publicKey, source) {
+    const persisted = writeSession(storage, publicKey, source);
+    connected = true;
+    ui.showConnected(
+      publicKey,
+      persisted ? "" : "Wallet connected, but this session could not be saved.",
+    );
+    emit("wallet:connected", { publicKey, source });
+    return publicKey;
+  }
+
+  function failConnection(error) {
+    connected = false;
+    ui.showDisconnected({
+      reconnect: readSession(storage) !== null,
+      statusText: `❌ ${errorMessage(error, "Unable to connect wallet.")}`,
+    });
+    return null;
+  }
+
   async function connect() {
     if (mobile && mobile.isMobile() && ui.supportsWalletPicker) {
       return connectMobile();
     }
 
+    // Desktop wallet registry (issue #142): when the page exposes the
+    // extension registry, route through it — direct connect for one detected
+    // wallet, an inline chooser for several, the accessible manual form for
+    // none. Without the registry (e.g. unit harness), keep the historical
+    // Freighter-provider / prompt fallback below.
+    if (desktop) {
+      return connectDesktop();
+    }
+
+    return connectViaProvider();
+  }
+
+  async function connectViaProvider() {
     ui.showConnecting();
 
     try {
@@ -507,23 +632,87 @@ function createWalletSession({
         publicKey = promptedAddress;
       }
 
-      const persisted = writeSession(storage, publicKey, source);
-      connected = true;
-      ui.showConnected(
-        publicKey,
-        persisted
-          ? ""
-          : "Wallet connected, but this session could not be saved.",
-      );
-      emit("wallet:connected", { publicKey, source });
-      return publicKey;
+      return completeConnection(publicKey, source);
     } catch (error) {
-      connected = false;
-      ui.showDisconnected({
-        reconnect: readSession(storage) !== null,
-        statusText: `❌ ${errorMessage(error, "Unable to connect wallet.")}`,
+      return failConnection(error);
+    }
+  }
+
+  function connectDesktop() {
+    ui.showConnecting();
+
+    let detected = [];
+    try {
+      detected = desktop.detected() || [];
+    } catch (_error) {
+      detected = [];
+    }
+
+    // Exactly one extension keeps the historical one-click UX.
+    if (detected.length === 1) {
+      void finishDesktopWallet(detected[0]);
+      return null;
+    }
+
+    // Several extensions: let the user pick. Fall back to the first if the
+    // page lacks the chooser markup.
+    if (detected.length > 1) {
+      if (ui.supportsDesktopChooser) {
+        ui.openDesktopChooser(detected, {
+          onSelect(wallet) {
+            void finishDesktopWallet(wallet);
+          },
+          onCancel() {
+            ui.showDisconnected({
+              reconnect: readSession(storage) !== null,
+              statusText: "",
+            });
+          },
+        });
+        return null;
+      }
+      void finishDesktopWallet(detected[0]);
+      return null;
+    }
+
+    // No extension detected: accessible manual entry (issue #148), or the
+    // window.prompt() fallback when the form markup is absent.
+    if (ui.supportsManualForm) {
+      ui.openManualForm({
+        submit(address) {
+          if (!isValidPublicKey(address)) {
+            return "Enter a valid Stellar public key (starts with G, 56 chars).";
+          }
+          void completeConnection(address, "manual");
+          return null;
+        },
+        onCancel() {
+          ui.showDisconnected({
+            reconnect: readSession(storage) !== null,
+            statusText: "",
+          });
+        },
       });
       return null;
+    }
+
+    return connectViaProvider();
+  }
+
+  async function finishDesktopWallet(wallet) {
+    try {
+      ui.setStatus(`Connecting with ${wallet.name}…`);
+      const publicKey = await wallet.connect();
+      if (!isValidPublicKey(publicKey)) {
+        throw new Error(`${wallet.name} did not return a valid public key.`);
+      }
+      // Only Freighter has a silent-restore path (restoreFreighterAddress);
+      // every other extension is persisted as a generic session that offers
+      // an explicit reconnect on the next load.
+      const source = wallet.id === "freighter" ? "freighter" : "manual";
+      return completeConnection(publicKey, source);
+    } catch (error) {
+      return failConnection(error);
     }
   }
 
@@ -570,6 +759,10 @@ function createDomUi(document) {
   const pickerOverlay = document.getElementById("wallet-picker-overlay");
   const pickerOptions = document.getElementById("wallet-options");
   const pickerInput = document.getElementById("pubkey-input");
+  // Optional accessible wrapper (issue #148): a labelled container around the
+  // public-key input. When present it — not the bare input — carries the
+  // hidden/shown state, so toggle whichever the markup provides.
+  const pickerField = document.getElementById("pubkey-field");
   const pickerCancel = document.getElementById("wallet-picker-cancel");
   const supportsWalletPicker = Boolean(
     pickerOverlay && pickerOptions && pickerInput,
@@ -585,6 +778,7 @@ function createDomUi(document) {
   function closeWalletPicker() {
     if (!supportsWalletPicker) return;
     pickerOverlay.classList.remove("open");
+    if (pickerField) pickerField.style.display = "none";
     pickerInput.style.display = "none";
     pickerInput.value = "";
     pickerInput.onkeydown = null;
@@ -600,6 +794,7 @@ function createDomUi(document) {
   }
 
   function showPickerConfirm(wallet, onConfirm) {
+    if (pickerField) pickerField.style.display = "block";
     pickerInput.style.display = "block";
     pickerInput.focus();
     const confirm = () => onConfirm(wallet, pickerInput.value.trim());
@@ -624,8 +819,74 @@ function createDomUi(document) {
     pickerOptions.append(hint, confirmButton);
   }
 
+  // The desktop multi-wallet chooser (issue #142) and accessible manual-entry
+  // form (issue #148) are both optional — pages without the markup degrade to
+  // direct connect / window.prompt via the controller's fallbacks.
+  const desktopWallets = document.getElementById("desktop-wallets");
+  const desktopWalletOptions = document.getElementById("desktop-wallet-options");
+  const desktopWalletsCancel = document.getElementById("desktop-wallets-cancel");
+  const supportsDesktopChooser = Boolean(desktopWallets && desktopWalletOptions);
+
+  const manualForm = document.getElementById("manual-form");
+  const manualInput = document.getElementById("manual-address");
+  const manualCancel = document.getElementById("manual-cancel");
+  const supportsManualForm = Boolean(manualForm && manualInput);
+
+  let onDesktopSelect = null;
+  let onDesktopCancel = null;
+  let onManualSubmit = null;
+  let onManualCancel = null;
+
+  function closeDesktopChooser() {
+    if (!supportsDesktopChooser) return;
+    desktopWallets.style.display = "none";
+    desktopWalletOptions.textContent = "";
+    onDesktopSelect = null;
+    onDesktopCancel = null;
+  }
+
+  function closeManualForm() {
+    if (!supportsManualForm) return;
+    manualForm.style.display = "none";
+    manualInput.value = "";
+    onManualSubmit = null;
+    onManualCancel = null;
+  }
+
+  if (desktopWalletsCancel) {
+    desktopWalletsCancel.addEventListener("click", () => {
+      const cancelHandler = onDesktopCancel;
+      closeDesktopChooser();
+      if (cancelHandler) cancelHandler();
+    });
+  }
+
+  if (manualForm) {
+    manualForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (!onManualSubmit) return;
+      const error = onManualSubmit(manualInput.value.trim());
+      if (error) {
+        status.textContent = `Error: ${error}`;
+        manualInput.focus();
+      }
+      // On success the controller drives showConnected(), which closes the
+      // form; nothing to do here.
+    });
+  }
+
+  if (manualCancel) {
+    manualCancel.addEventListener("click", () => {
+      const cancelHandler = onManualCancel;
+      closeManualForm();
+      if (cancelHandler) cancelHandler();
+    });
+  }
+
   return {
     supportsWalletPicker,
+    supportsDesktopChooser,
+    supportsManualForm,
     showConnecting() {
       hideWalletInfo();
       button.textContent = "Connecting…";
@@ -640,6 +901,8 @@ function createDomUi(document) {
     },
     showConnected(publicKey, statusText) {
       closeWalletPicker();
+      closeDesktopChooser();
+      closeManualForm();
       walletAddress.textContent = publicKey;
       walletInfo.style.display = "block";
       button.textContent = "Disconnect";
@@ -648,6 +911,8 @@ function createDomUi(document) {
     },
     showDisconnected({ reconnect, statusText }) {
       closeWalletPicker();
+      closeDesktopChooser();
+      closeManualForm();
       hideWalletInfo();
       button.textContent = reconnect ? "Reconnect Wallet" : "Connect Wallet";
       button.disabled = false;
@@ -681,6 +946,50 @@ function createDomUi(document) {
       return true;
     },
     closeWalletPicker,
+    openDesktopChooser(wallets, { onSelect, onCancel }) {
+      if (!supportsDesktopChooser) return false;
+
+      onDesktopSelect = onSelect || null;
+      onDesktopCancel = onCancel || null;
+      desktopWalletOptions.textContent = "";
+      wallets.forEach((wallet) => {
+        const option = document.createElement("button");
+        option.type = "button";
+        option.className = "wallet-option";
+        const icon = document.createElement("span");
+        icon.className = "icon";
+        icon.setAttribute("aria-hidden", "true");
+        icon.textContent = wallet.icon || "⭐";
+        const name = document.createElement("span");
+        name.textContent = wallet.name;
+        option.append(icon, name);
+        option.addEventListener("click", () => {
+          if (onDesktopSelect) onDesktopSelect(wallet);
+        });
+        desktopWalletOptions.appendChild(option);
+      });
+
+      desktopWallets.style.display = "block";
+      status.textContent =
+        "Several wallet extensions detected. Choose one to connect.";
+      const firstOption = desktopWalletOptions.querySelector("button");
+      if (firstOption) firstOption.focus();
+      return true;
+    },
+    closeDesktopChooser,
+    openManualForm({ submit, onCancel }) {
+      if (!supportsManualForm) return false;
+
+      onManualSubmit = submit || null;
+      onManualCancel = onCancel || null;
+      manualInput.value = "";
+      manualForm.style.display = "block";
+      status.textContent =
+        "No wallet extension detected. Enter your Stellar public key below.";
+      manualInput.focus();
+      return true;
+    },
+    closeManualForm,
     onAction(handler) {
       button.addEventListener("click", handler);
     },
@@ -719,6 +1028,11 @@ async function initializeWalletPage(browserWindow) {
           start: (wallet, account) =>
             mobileApi.startMobileConnect(wallet, account),
           handleReturn: () => mobileApi.handleMobileReturn(),
+        }
+      : null,
+    desktop: mobileApi
+      ? {
+          detected: () => mobileApi.detectedDesktopWallets(),
         }
       : null,
   });

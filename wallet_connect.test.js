@@ -386,5 +386,5 @@ test("HTML loads the external wallet script without inline click handlers", () =
     /<script src="wallet_connect\.js" defer><\/script>/,
   );
   assert.doesNotMatch(html, /onclick=/);
-  assert.match(html, /<p id="status" aria-live="polite"><\/p>/);
+  assert.match(html, /<p id="status"[^>]*aria-live="polite"[^>]*><\/p>/);
 });
